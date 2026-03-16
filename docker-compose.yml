@@ -1,0 +1,31 @@
+services:
+  supermarket:
+    build: supermarket
+    mem_limit: 512m
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:mysql://smysql:3306/superdb?createDatabaseIfNotExist=true&serverTimezone=UTC
+      DB_USERNAME: admin
+      DB_PASSWORD: s123456
+      DB_PLATFORM: org.hibernate.dialect.MySQL8Dialect    
+      SERVER_PORT: 8080
+    restart: always  
+    depends_on:
+      smysql:
+        condition: service_healthy
+  smysql:
+    image: mysql:8.0.33
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: r123456
+      MYSQL_PASSWORD: s123456
+      MYSQL_USER: admin
+      MYSQL_DATABASE: superdb
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
