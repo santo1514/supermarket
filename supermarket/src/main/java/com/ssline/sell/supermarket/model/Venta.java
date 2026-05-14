@@ -31,6 +31,6 @@ public class Venta {
     private Double total;
     @ManyToOne
     private Sucursal sucursal;
-    @OneToMany (mappedBy = "venta", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.EAGER)
+    @OneToMany(mappedBy = "venta", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
     private List<DetalleVenta> detalle = new ArrayList<>();
 }

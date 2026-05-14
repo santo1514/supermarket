@@ -1,0 +1,313 @@
+# ─────────────────────────────────────────────────────────────────
+#  Supermarket – Azure DevOps CI/CD Pipeline
+#
+#  Stages:
+#    1. Build       – Compila imagen Docker y la publica en ACR
+#    2. DeployDev   – Despliega en Container App DEV
+#    3. TestDev     – Karate (aceptación) + JMeter (performance) en paralelo
+#    4. DeployTest  – Despliega en Container App TEST (requiere aprobación)
+#    5. QA          – Karate contra el ambiente TEST
+# ─────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  # ── Azure ────────────────────────────────────────────────────────
+  ACR_NAME:             'supermarketacr'         # sin .azurecr.io
+  RESOURCE_GROUP:       'rg-supermarket'
+  LOCATION:             'eastus'
+
+  # ── Container Apps ───────────────────────────────────────────────
+  CA_ENV:               'supermarket-env'         # entorno compartido
+  CA_DEV:               'supermarket-dev'
+  CA_TEST:              'supermarket-test'
+
+  # ── Imagen ───────────────────────────────────────────────────────
+  IMAGE_NAME:           'supermarket'
+  IMAGE_TAG:            '$(Build.BuildId)'
+
+  # ── Service Connections (configurar en Project Settings) ─────────
+  SC_ACR:               'sc-acr-supermarket'
+  SC_AZURE:             'sc-azure-supermarket'
+
+  # ── Paths ────────────────────────────────────────────────────────
+  DOCKER_CONTEXT:       'supermarket'
+  DOCKERFILE:           'supermarket/Dockerfile'
+  KARATE_POM:           'supermarket/test/acceptanceTest/pom.xml'
+  JMETER_PLAN:          'supermarket/test/performance/supermarket-load-test.jmx'
+  JMETER_VERSION:       '5.6.3'
+
+
+# ═════════════════════════════════════════════════════════════════
+#  STAGE 1 ── Build & Push Docker image
+# ═════════════════════════════════════════════════════════════════
+stages:
+- stage: Build
+  displayName: '1 · Build & Push'
+  jobs:
+  - job: BuildPush
+    displayName: 'Docker build → ACR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: Docker@2
+      displayName: 'Build & Push imagen a ACR'
+      inputs:
+        containerRegistry: '$(SC_ACR)'
+        repository:        '$(IMAGE_NAME)'
+        command:           'buildAndPush'
+        Dockerfile:        '$(DOCKERFILE)'
+        buildContext:      '$(DOCKER_CONTEXT)'
+        tags: |
+          $(IMAGE_TAG)
+          latest
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publicar tag de imagen como artefacto'
+      inputs:
+        targetPath: '/dev/null'
+        artifact:   'image-metadata'
+        properties: '{"imageTag":"$(IMAGE_TAG)","imageFull":"$(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(IMAGE_TAG)"}'
+
+
+# ═════════════════════════════════════════════════════════════════
+#  STAGE 2 ── Deploy to DEV
+# ═════════════════════════════════════════════════════════════════
+- stage: DeployDev
+  displayName: '2 · Deploy → DEV'
+  dependsOn: Build
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy Container App DEV'
+    environment: 'dev'            # sin approval gate
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'az containerapp update (DEV)'
+            inputs:
+              azureSubscription: '$(SC_AZURE)'
+              scriptType:        'bash'
+              scriptLocation:    'inlineScript'
+              inlineScript: |
+                az containerapp update \
+                  --name            $(CA_DEV) \
+                  --resource-group  $(RESOURCE_GROUP) \
+                  --image           $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(IMAGE_TAG)
+
+          - task: AzureCLI@2
+            displayName: 'Health check DEV (espera hasta 120s)'
+            inputs:
+              azureSubscription: '$(SC_AZURE)'
+              scriptType:        'bash'
+              scriptLocation:    'inlineScript'
+              inlineScript: |
+                FQDN=$(az containerapp show \
+                  --name $(CA_DEV) \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --query properties.configuration.ingress.fqdn -o tsv)
+
+                echo "FQDN DEV: $FQDN"
+                echo "##vso[task.setvariable variable=DEV_URL;isOutput=true]https://$FQDN"
+
+                for i in $(seq 1 12); do
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$FQDN/api/productos || true)
+                  echo "Intento $i → HTTP $STATUS"
+                  [ "$STATUS" = "200" ] && exit 0
+                  sleep 10
+                done
+                echo "##vso[task.logissue type=error]DEV no respondió en 120s"
+                exit 1
+            name: devHealth
+
+
+# ═════════════════════════════════════════════════════════════════
+#  STAGE 3 ── Tests en DEV (Karate + JMeter en paralelo)
+# ═════════════════════════════════════════════════════════════════
+- stage: TestDev
+  displayName: '3 · Tests en DEV'
+  dependsOn: DeployDev
+  variables:
+    DEV_FQDN: $[ stageDependencies.DeployDev.DeployDev.outputs['DeployDev.devHealth.DEV_URL'] ]
+  jobs:
+
+  # ── JOB A: Karate Acceptance Tests ──────────────────────────────
+  - job: KarateTests
+    displayName: 'Karate – Aceptación'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: JavaToolInstaller@0
+      displayName: 'Java 21'
+      inputs:
+        versionSpec:           '21'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption:       'PreInstalled'
+
+    - task: Maven@4
+      displayName: 'mvn test (Karate)'
+      inputs:
+        mavenPomFile:       '$(KARATE_POM)'
+        goals:              'test'
+        options:            '-DbaseUrl=$(DEV_FQDN)'
+        publishJUnitResults: true
+        testResultsFiles:   '**/surefire-reports/TEST-*.xml'
+        testRunTitle:       'Karate DEV'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publicar reporte Karate'
+      condition: always()
+      inputs:
+        targetPath: 'supermarket/test/acceptanceTest/target/karate-reports'
+        artifact:   'karate-report-dev'
+
+  # ── JOB B: JMeter Performance Tests ─────────────────────────────
+  - job: JMeterTests
+    displayName: 'JMeter – Performance'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        wget -q https://downloads.apache.org/jmeter/binaries/apache-jmeter-$(JMETER_VERSION).tgz
+        tar -xzf apache-jmeter-$(JMETER_VERSION).tgz
+      displayName: 'Instalar JMeter $(JMETER_VERSION)'
+
+    - script: |
+        DEV_HOST=$(echo "$(DEV_FQDN)" | sed 's|https://||')
+        mkdir -p $(Build.ArtifactStagingDirectory)/jmeter
+
+        apache-jmeter-$(JMETER_VERSION)/bin/jmeter \
+          -n \
+          -t $(JMETER_PLAN) \
+          -l $(Build.ArtifactStagingDirectory)/jmeter/results.jtl \
+          -e -o $(Build.ArtifactStagingDirectory)/jmeter/report \
+          -Jhost=$DEV_HOST \
+          -Jport=443 \
+          -Jprotocol=https \
+          -Jthreads=20 \
+          -JrampUp=15 \
+          -Jiterations=10
+      displayName: 'Ejecutar plan JMeter'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publicar reporte JMeter'
+      condition: always()
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/jmeter/report'
+        artifact:   'jmeter-report'
+
+    - script: |
+        # Falla el stage si el % de errores supera el umbral
+        ERRORS=$(grep -c ",false," $(Build.ArtifactStagingDirectory)/jmeter/results.jtl || echo 0)
+        TOTAL=$(grep -c "," $(Build.ArtifactStagingDirectory)/jmeter/results.jtl || echo 1)
+        PCT=$(echo "scale=2; $ERRORS * 100 / $TOTAL" | bc)
+        echo "Errores: $ERRORS / $TOTAL ($PCT%)"
+        if (( $(echo "$PCT > 5" | bc -l) )); then
+          echo "##vso[task.logissue type=error]Tasa de error $PCT% supera el umbral del 5%"
+          exit 1
+        fi
+      displayName: 'Validar umbral de errores (< 5%)'
+      condition: succeeded()
+
+
+# ═════════════════════════════════════════════════════════════════
+#  STAGE 4 ── Deploy to TEST  ⚠️  REQUIERE APROBACIÓN MANUAL
+#             (configurar en Environments > test > Approvals)
+# ═════════════════════════════════════════════════════════════════
+- stage: DeployTest
+  displayName: '4 · Deploy → TEST  [aprobación requerida]'
+  dependsOn:
+    - TestDev
+  condition: succeeded('TestDev')
+  jobs:
+  - deployment: DeployTest
+    displayName: 'Deploy Container App TEST'
+    environment: 'test'           # ← approval gate definido aquí
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'az containerapp update (TEST)'
+            inputs:
+              azureSubscription: '$(SC_AZURE)'
+              scriptType:        'bash'
+              scriptLocation:    'inlineScript'
+              inlineScript: |
+                az containerapp update \
+                  --name            $(CA_TEST) \
+                  --resource-group  $(RESOURCE_GROUP) \
+                  --image           $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(IMAGE_TAG)
+
+          - task: AzureCLI@2
+            displayName: 'Health check TEST (espera hasta 120s)'
+            inputs:
+              azureSubscription: '$(SC_AZURE)'
+              scriptType:        'bash'
+              scriptLocation:    'inlineScript'
+              inlineScript: |
+                FQDN=$(az containerapp show \
+                  --name $(CA_TEST) \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --query properties.configuration.ingress.fqdn -o tsv)
+
+                echo "FQDN TEST: $FQDN"
+                echo "##vso[task.setvariable variable=TEST_URL;isOutput=true]https://$FQDN"
+
+                for i in $(seq 1 12); do
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$FQDN/api/productos || true)
+                  echo "Intento $i → HTTP $STATUS"
+                  [ "$STATUS" = "200" ] && exit 0
+                  sleep 10
+                done
+                echo "##vso[task.logissue type=error]TEST no respondió en 120s"
+                exit 1
+            name: testHealth
+
+
+# ═════════════════════════════════════════════════════════════════
+#  STAGE 5 ── QA Tests en TEST
+# ═════════════════════════════════════════════════════════════════
+- stage: QA
+  displayName: '5 · QA Tests en TEST'
+  dependsOn: DeployTest
+  variables:
+    TEST_FQDN: $[ stageDependencies.DeployTest.DeployTest.outputs['DeployTest.testHealth.TEST_URL'] ]
+  jobs:
+  - job: QATests
+    displayName: 'Karate – QA'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: JavaToolInstaller@0
+      displayName: 'Java 21'
+      inputs:
+        versionSpec:           '21'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption:       'PreInstalled'
+
+    - task: Maven@4
+      displayName: 'mvn test (Karate QA)'
+      inputs:
+        mavenPomFile:       '$(KARATE_POM)'
+        goals:              'test'
+        options:            '-DbaseUrl=$(TEST_FQDN) -Dkarate.env=test'
+        publishJUnitResults: true
+        testResultsFiles:   '**/surefire-reports/TEST-*.xml'
+        testRunTitle:       'Karate TEST (QA)'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publicar reporte Karate QA'
+      condition: always()
+      inputs:
+        targetPath: 'supermarket/test/acceptanceTest/target/karate-reports'
+        artifact:   'karate-report-test'
